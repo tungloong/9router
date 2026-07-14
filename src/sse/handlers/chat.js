@@ -17,6 +17,10 @@ import { appendPxpipeEvent } from "@/lib/pxpipe/events.js";
 import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { handleComboChat, handleFusionChat } from "open-sse/services/combo.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
+import {
+  isOfficialPassthroughModel,
+  handleOfficialPassthrough,
+} from "open-sse/utils/officialPassthrough.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
 import { detectFormatByEndpoint } from "open-sse/translator/formats.js";
 import * as log from "../utils/logger.js";
@@ -79,6 +83,12 @@ export async function handleChat(request, clientRawRequest = null) {
   if (!modelStr) {
     log.warn("CHAT", "Missing model");
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
+  }
+
+  // Official model passthrough (config: ~/.9router/official-passthrough.json).
+  // Matches bare IDs like "gpt-5.5" only — prefixed routes (cx/gpt-5.5) keep OAuth routing.
+  if (isOfficialPassthroughModel(modelStr)) {
+    return handleOfficialPassthrough(request, body, { log });
   }
 
   // Bypass naming/warmup requests before combo rotation to avoid wasting rotation slots
