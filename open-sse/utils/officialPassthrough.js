@@ -1,21 +1,17 @@
 /**
- * Official OpenAI / ChatGPT model passthrough.
+ * Official OpenAI / ChatGPT Responses passthrough.
  *
- * When body.model matches a configured ID (e.g. "gpt-5.5"), forward the request
- * almost as-is to the official backend — without 9Router provider routing,
- * OAuth connection selection, or format translation.
+ * Only applies to Responses endpoints (/v1/responses, /codex/*, /responses).
+ * Chat Completions and Messages never passthrough.
  *
- * Prefixed models (cx/gpt-5.5) never match unless explicitly listed, so the
- * existing Codex OAuth routing layer stays intact.
+ * When body.model matches a configured ID (e.g. "gpt-5.5"), reverse-proxy the
+ * request to the official backend — no provider routing or translation.
+ * Prefixed models (cx/gpt-5.5) only match if that full string is listed.
  *
- * Config file (created on first use if missing):
- *   ~/.9router/official-passthrough.json
- *   or $DATA_DIR/official-passthrough.json
- *   or $OFFICIAL_PASSTHROUGH_CONFIG
- *
+ * Config (~/.9router/official-passthrough.json, or $OFFICIAL_PASSTHROUGH_CONFIG):
  * {
  *   "enabled": true,
- *   "models": ["gpt-5.5", "gpt-5.6", "gpt-5.4-mini"],
+ *   "models": ["gpt-5.5", "gpt-5.6"],
  *   "preferClientAuth": true,
  *   "fallbackCodexAuthJson": true
  * }
@@ -27,17 +23,9 @@ import path from "node:path";
 import { proxyAwareFetch } from "./proxyFetch.js";
 
 const HOP_BY_HOP = new Set([
-  "host",
-  "connection",
-  "keep-alive",
-  "proxy-authenticate",
-  "proxy-authorization",
-  "te",
-  "trailers",
-  "transfer-encoding",
-  "upgrade",
-  "content-length",
-  "accept-encoding",
+  "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+  "te", "trailers", "transfer-encoding", "upgrade", "content-length", "accept-encoding",
+  "x-forwarded-for", "x-forwarded-host", "x-forwarded-proto",
 ]);
 
 const DUMMY_AUTH_MARKERS = ["dummy", "opencodex", "9router", "placeholder"];
@@ -47,7 +35,6 @@ const DEFAULT_CONFIG = {
   models: ["gpt-5.5", "gpt-5.6"],
   preferClientAuth: true,
   fallbackCodexAuthJson: true,
-  /** Optional absolute path to Codex auth.json (default: ~/.codex/auth.json) */
   codexAuthPath: null,
 };
 
@@ -64,39 +51,51 @@ function resolveDataDir() {
 }
 
 export function getOfficialPassthroughConfigPath() {
-  if (process.env.OFFICIAL_PASSTHROUGH_CONFIG) {
-    return process.env.OFFICIAL_PASSTHROUGH_CONFIG;
-  }
+  if (process.env.OFFICIAL_PASSTHROUGH_CONFIG) return process.env.OFFICIAL_PASSTHROUGH_CONFIG;
   return path.join(resolveDataDir(), "official-passthrough.json");
 }
 
 function ensureConfigFile(configPath) {
   try {
     if (fs.existsSync(configPath)) return;
-    const dir = path.dirname(configPath);
-    fs.mkdirSync(dir, { recursive: true });
+    fs.mkdirSync(path.dirname(configPath), { recursive: true });
     fs.writeFileSync(configPath, `${JSON.stringify(DEFAULT_CONFIG, null, 2)}\n`, "utf-8");
   } catch {
-    // fail-open: missing/unwritable config simply disables passthrough
+    // fail-open
   }
 }
 
 function normalizeModels(models) {
   if (!Array.isArray(models)) return [];
-  const out = [];
-  for (const entry of models) {
-    if (typeof entry !== "string") continue;
-    const id = entry.trim();
-    if (!id) continue;
-    out.push(id);
-  }
-  return out;
+  return models
+    .filter((m) => typeof m === "string" && m.trim())
+    .map((m) => m.trim());
 }
 
 /**
- * Load and cache config. Re-reads when the file mtime changes.
- * @returns {{ enabled: boolean, models: string[], modelSet: Set<string>, preferClientAuth: boolean, fallbackCodexAuthJson: boolean, codexAuthPath: string|null, path: string }}
+ * Normalize request path (strip /api prefix from Next rewrites).
  */
+export function normalizeRequestPath(pathname) {
+  let p = String(pathname || "");
+  if (p.startsWith("/api/")) p = p.slice(4);
+  if (!p.startsWith("/")) p = `/${p}`;
+  return p;
+}
+
+/**
+ * True for Responses-family endpoints used by Codex Desktop / CLI.
+ * Does NOT match chat/completions or messages.
+ */
+export function isResponsesEndpoint(pathname) {
+  const p = normalizeRequestPath(pathname);
+  if (p.includes("/chat/completions") || p.includes("/messages")) return false;
+  return (
+    p.includes("/responses")
+    || p === "/codex"
+    || p.startsWith("/codex/")
+  );
+}
+
 export function loadOfficialPassthroughConfig({ forceReload = false } = {}) {
   const configPath = getOfficialPassthroughConfigPath();
   ensureConfigFile(configPath);
@@ -120,8 +119,7 @@ export function loadOfficialPassthroughConfig({ forceReload = false } = {}) {
   let parsed = { ...DEFAULT_CONFIG };
   try {
     if (mtimeMs != null) {
-      const raw = fs.readFileSync(configPath, "utf-8");
-      const json = JSON.parse(raw);
+      const json = JSON.parse(fs.readFileSync(configPath, "utf-8"));
       if (json && typeof json === "object" && !Array.isArray(json)) {
         parsed = {
           ...DEFAULT_CONFIG,
@@ -135,12 +133,10 @@ export function loadOfficialPassthroughConfig({ forceReload = false } = {}) {
   }
 
   const models = normalizeModels(parsed.models);
-  const modelSet = new Set(models.map((m) => m.toLowerCase()));
-
   cachedConfig = {
-    enabled: parsed.enabled !== false && models.length > 0,
+    enabled: parsed.enabled === true && models.length > 0,
     models,
-    modelSet,
+    modelSet: new Set(models.map((m) => m.toLowerCase())),
     preferClientAuth: parsed.preferClientAuth !== false,
     fallbackCodexAuthJson: parsed.fallbackCodexAuthJson !== false,
     codexAuthPath: typeof parsed.codexAuthPath === "string" && parsed.codexAuthPath.trim()
@@ -160,10 +156,6 @@ export function _resetOfficialPassthroughCache() {
   cachedConfigPath = null;
 }
 
-/**
- * True when body.model is an exact (case-insensitive) match of a configured passthrough ID.
- * Prefixed models like "cx/gpt-5.5" only match if that full string is listed.
- */
 export function isOfficialPassthroughModel(modelStr, config = null) {
   if (!modelStr || typeof modelStr !== "string") return false;
   const cfg = config || loadOfficialPassthroughConfig();
@@ -171,21 +163,22 @@ export function isOfficialPassthroughModel(modelStr, config = null) {
   return cfg.modelSet.has(modelStr.trim().toLowerCase());
 }
 
-function headerMap(headers) {
-  if (!headers) return {};
-  if (typeof headers.entries === "function") {
-    return Object.fromEntries(headers.entries());
-  }
-  if (typeof headers === "object") return { ...headers };
-  return {};
+/**
+ * Gate: Responses endpoint + model in config list.
+ */
+export function shouldOfficialPassthrough(modelStr, pathname, config = null) {
+  if (!isResponsesEndpoint(pathname)) return false;
+  return isOfficialPassthroughModel(modelStr, config);
 }
 
 function getHeader(headers, name) {
+  if (!headers) return undefined;
   const lower = name.toLowerCase();
+  if (typeof headers.get === "function") {
+    return headers.get(name) || headers.get(lower) || undefined;
+  }
   for (const [k, v] of Object.entries(headers)) {
-    if (k.toLowerCase() === lower) {
-      return Array.isArray(v) ? v[0] : v;
-    }
+    if (k.toLowerCase() === lower) return Array.isArray(v) ? v[0] : v;
   }
   return undefined;
 }
@@ -193,12 +186,9 @@ function getHeader(headers, name) {
 function isUsableAuthHeader(value) {
   if (!value || typeof value !== "string") return false;
   const trimmed = value.trim();
-  if (!trimmed) return false;
+  if (!trimmed || /^bearer\s*$/i.test(trimmed)) return false;
   const lower = trimmed.toLowerCase();
-  if (DUMMY_AUTH_MARKERS.some((m) => lower.includes(m))) return false;
-  // Bare "Bearer" with empty token
-  if (/^bearer\s*$/i.test(trimmed)) return false;
-  return true;
+  return !DUMMY_AUTH_MARKERS.some((m) => lower.includes(m));
 }
 
 function extractAccountIdFromJwt(token) {
@@ -236,7 +226,6 @@ function readCodexAuthJson(codexAuthPath) {
     return {
       accessToken: typeof accessToken === "string" ? accessToken : null,
       accountId: typeof accountId === "string" ? accountId : null,
-      path: authPath,
     };
   } catch {
     return null;
@@ -244,103 +233,73 @@ function readCodexAuthJson(codexAuthPath) {
 }
 
 /**
- * Resolve target official URL from the incoming path + ChatGPT account signal.
+ * Map incoming Responses path → official upstream URL.
  */
 export function resolveOfficialPassthroughUrl(pathname, { hasChatGptAccount } = {}) {
-  const raw = String(pathname || "");
-  // Strip Next rewrite prefix /api
-  let p = raw.startsWith("/api/") ? raw.slice(4) : raw;
-  if (!p.startsWith("/")) p = `/${p}`;
-
-  // Normalize: ensure /v1 prefix for OpenAI API path matching
+  const p = normalizeRequestPath(pathname);
   const isCompact = /\/responses\/compact\/?$/.test(p) || p.endsWith("/compact");
-  const isResponses = p.includes("/responses") || p === "/codex" || p.startsWith("/codex/");
-  const isChatCompletions = p.includes("/chat/completions");
 
   if (hasChatGptAccount) {
-    if (isCompact) return "https://chatgpt.com/backend-api/codex/responses/compact";
-    if (isResponses || !isChatCompletions) {
-      // Codex Desktop Responses is the primary path; unknown → codex/responses
-      return "https://chatgpt.com/backend-api/codex/responses";
-    }
-    // Chat Completions with ChatGPT account is uncommon; still prefer backend-api
-    return "https://chatgpt.com/backend-api/codex/responses";
+    return isCompact
+      ? "https://chatgpt.com/backend-api/codex/responses/compact"
+      : "https://chatgpt.com/backend-api/codex/responses";
   }
-
-  if (isCompact) return "https://api.openai.com/v1/responses/compact";
-  if (isResponses) return "https://api.openai.com/v1/responses";
-  if (isChatCompletions) return "https://api.openai.com/v1/chat/completions";
-  return "https://api.openai.com/v1/responses";
+  return isCompact
+    ? "https://api.openai.com/v1/responses/compact"
+    : "https://api.openai.com/v1/responses";
 }
 
-function buildForwardHeaders(clientHeaders, { authHeader, accountId }) {
+function buildForwardHeaders(request, { authHeader, accountId }) {
   const out = {};
-  for (const [key, val] of Object.entries(clientHeaders)) {
-    const lower = key.toLowerCase();
-    if (HOP_BY_HOP.has(lower)) continue;
-    // Drop gateway-only headers
-    if (lower.startsWith("x-9r-")) continue;
-    if (lower === "x-forwarded-for" || lower === "x-forwarded-host" || lower === "x-forwarded-proto") continue;
-    const value = Array.isArray(val) ? val[0] : val;
-    if (value == null || value === "") continue;
-    out[key] = value;
+  if (request?.headers && typeof request.headers.forEach === "function") {
+    request.headers.forEach((value, key) => {
+      const lower = key.toLowerCase();
+      if (HOP_BY_HOP.has(lower) || lower.startsWith("x-9r-")) return;
+      if (value != null && value !== "") out[key] = value;
+    });
   }
 
   if (authHeader) {
-    out.Authorization = authHeader.startsWith("Bearer ") || authHeader.startsWith("bearer ")
-      ? authHeader
-      : `Bearer ${authHeader}`;
-    // Normalize casing
+    // Drop any existing authorization keys (any casing)
     for (const k of Object.keys(out)) {
-      if (k.toLowerCase() === "authorization" && k !== "Authorization") delete out[k];
+      if (k.toLowerCase() === "authorization") delete out[k];
     }
+    out.Authorization = /^bearer\s+/i.test(authHeader) ? authHeader : `Bearer ${authHeader}`;
   }
 
   if (accountId) {
-    // Official header name used by Codex backend
-    let hasAccount = false;
-    for (const k of Object.keys(out)) {
-      if (k.toLowerCase() === "chatgpt-account-id") {
-        hasAccount = true;
-        break;
-      }
-    }
-    if (!hasAccount) {
-      out["ChatGPT-Account-ID"] = accountId;
-    }
+    const hasAccount = Object.keys(out).some((k) => k.toLowerCase() === "chatgpt-account-id");
+    if (!hasAccount) out["ChatGPT-Account-ID"] = accountId;
   }
 
-  if (!out["Content-Type"] && !out["content-type"]) {
+  if (!Object.keys(out).some((k) => k.toLowerCase() === "content-type")) {
     out["Content-Type"] = "application/json";
   }
 
   return out;
 }
 
-function corsHeaders(extra = {}) {
-  return {
-    "Access-Control-Allow-Origin": "*",
-    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-    "Access-Control-Allow-Headers": "*",
-    ...extra,
-  };
+function jsonError(status, message, code, type = "invalid_request_error") {
+  return new Response(JSON.stringify({
+    error: { message, type, code },
+  }), {
+    status,
+    headers: {
+      "Content-Type": "application/json",
+      "Access-Control-Allow-Origin": "*",
+    },
+  });
 }
 
 /**
- * Transparent reverse-proxy of the current request to the official OpenAI/ChatGPT backend.
- * @param {Request} request
- * @param {object} body - already-parsed JSON body
- * @param {object} [options]
- * @param {object} [options.log]
- * @returns {Promise<Response>}
+ * Transparent reverse-proxy to official OpenAI / ChatGPT Responses backend.
  */
 export async function handleOfficialPassthrough(request, body, options = {}) {
   const log = options.log || null;
   const cfg = loadOfficialPassthroughConfig();
-  const clientHeaders = headerMap(request.headers);
 
-  const clientAuth = getHeader(clientHeaders, "authorization");
-  const clientAccountId = getHeader(clientHeaders, "chatgpt-account-id");
+  const clientAuth = getHeader(request.headers, "authorization");
+  const clientAccountId = getHeader(request.headers, "chatgpt-account-id");
 
   let authHeader = null;
   let accountId = clientAccountId || null;
@@ -358,14 +317,9 @@ export async function handleOfficialPassthrough(request, body, options = {}) {
         authHeader = `Bearer ${codexAuth.accessToken}`;
         authSource = "codex-auth.json";
       }
-      if (!accountId && codexAuth.accountId) {
-        accountId = codexAuth.accountId;
-      }
+      if (!accountId && codexAuth.accountId) accountId = codexAuth.accountId;
     }
   }
-
-  // If client sent chatgpt-account-id, treat as ChatGPT/Codex subscription path
-  const hasChatGptAccount = Boolean(accountId || clientAccountId);
 
   let pathname = "/v1/responses";
   try {
@@ -374,29 +328,24 @@ export async function handleOfficialPassthrough(request, body, options = {}) {
     // keep default
   }
 
+  const hasChatGptAccount = Boolean(accountId);
   const targetUrl = resolveOfficialPassthroughUrl(pathname, { hasChatGptAccount });
-  const forwardHeaders = buildForwardHeaders(clientHeaders, {
+  const forwardHeaders = buildForwardHeaders(request, {
     authHeader,
-    accountId: accountId || clientAccountId || null,
+    accountId,
   });
 
-  const model = body?.model || "";
   log?.info?.(
     "PASSTHROUGH",
-    `Official passthrough model=${model} → ${targetUrl} (auth=${authSource}, account=${accountId ? "yes" : "no"})`
+    `Responses passthrough model=${body?.model || ""} → ${targetUrl} (auth=${authSource}, account=${accountId ? "yes" : "no"})`
   );
 
   if (!authHeader) {
-    return new Response(JSON.stringify({
-      error: {
-        message: "Official passthrough: no usable Authorization. Sign in to Codex Desktop, or ensure ~/.codex/auth.json has tokens.access_token, or set preferClientAuth with a real Bearer token.",
-        type: "invalid_request_error",
-        code: "passthrough_auth_missing",
-      }
-    }), {
-      status: 401,
-      headers: corsHeaders({ "Content-Type": "application/json" }),
-    });
+    return jsonError(
+      401,
+      "Official passthrough: no usable Authorization. Sign in to Codex Desktop, or ensure ~/.codex/auth.json has tokens.access_token.",
+      "passthrough_auth_missing"
+    );
   }
 
   let upstream;
@@ -410,29 +359,20 @@ export async function handleOfficialPassthrough(request, body, options = {}) {
   } catch (err) {
     const message = err?.message || String(err);
     log?.error?.("PASSTHROUGH", `Upstream fetch failed: ${message}`);
-    return new Response(JSON.stringify({
-      error: {
-        message: `Official passthrough upstream error: ${message}`,
-        type: "server_error",
-        code: "passthrough_upstream_error",
-      }
-    }), {
-      status: 502,
-      headers: corsHeaders({ "Content-Type": "application/json" }),
-    });
+    return jsonError(502, `Official passthrough upstream error: ${message}`, "passthrough_upstream_error", "server_error");
   }
 
-  // Pipe status + body; preserve content-type for SSE vs JSON
-  const responseHeaders = corsHeaders();
+  const responseHeaders = {
+    "Access-Control-Allow-Origin": "*",
+  };
   const contentType = upstream.headers.get("content-type");
   if (contentType) responseHeaders["Content-Type"] = contentType;
-  const cacheControl = upstream.headers.get("cache-control");
-  if (cacheControl) responseHeaders["Cache-Control"] = cacheControl;
-
-  // For SSE, avoid buffering
   if (contentType?.includes("text/event-stream")) {
     responseHeaders["Cache-Control"] = "no-cache";
     responseHeaders["Connection"] = "keep-alive";
+  } else {
+    const cacheControl = upstream.headers.get("cache-control");
+    if (cacheControl) responseHeaders["Cache-Control"] = cacheControl;
   }
 
   return new Response(upstream.body, {

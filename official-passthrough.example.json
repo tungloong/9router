@@ -6,5 +6,6 @@
     "gpt-5.4-mini"
   ],
   "preferClientAuth": true,
-  "fallbackCodexAuthJson": true
+  "fallbackCodexAuthJson": true,
+  "_comment": "Only /v1/responses (+ /codex/* rewrites). Chat Completions and Messages never passthrough."
 }

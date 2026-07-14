@@ -18,7 +18,7 @@ import { errorResponse, unavailableResponse } from "open-sse/utils/error.js";
 import { handleComboChat, handleFusionChat } from "open-sse/services/combo.js";
 import { handleBypassRequest } from "open-sse/utils/bypassHandler.js";
 import {
-  isOfficialPassthroughModel,
+  shouldOfficialPassthrough,
   handleOfficialPassthrough,
 } from "open-sse/utils/officialPassthrough.js";
 import { HTTP_STATUS } from "open-sse/config/runtimeConfig.js";
@@ -85,9 +85,10 @@ export async function handleChat(request, clientRawRequest = null) {
     return errorResponse(HTTP_STATUS.BAD_REQUEST, "Missing model");
   }
 
-  // Official model passthrough (config: ~/.9router/official-passthrough.json).
-  // Matches bare IDs like "gpt-5.5" only — prefixed routes (cx/gpt-5.5) keep OAuth routing.
-  if (isOfficialPassthroughModel(modelStr)) {
+  // Official Responses passthrough (config: ~/.9router/official-passthrough.json).
+  // Only /v1/responses (+ /codex/* rewrites). Chat Completions / Messages never match.
+  // Bare IDs like "gpt-5.5"; prefixed cx/gpt-5.5 keeps OAuth routing unless listed.
+  if (shouldOfficialPassthrough(modelStr, clientRawRequest?.endpoint || "")) {
     return handleOfficialPassthrough(request, body, { log });
   }
 

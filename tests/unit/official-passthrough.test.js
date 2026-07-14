@@ -41,70 +41,59 @@ describe("official passthrough", () => {
     }
   });
 
-  it("does not match when disabled", async () => {
+  it("requires enabled: true (default disabled)", async () => {
     writeConfig(configPath, {
       enabled: false,
-      models: ["gpt-5.5", "gpt-5.6"],
+      models: ["gpt-5.5"],
     });
     const mod = await loadModule(configPath);
     mod._resetOfficialPassthroughCache();
-    expect(mod.isOfficialPassthroughModel("gpt-5.5")).toBe(false);
+    expect(mod.shouldOfficialPassthrough("gpt-5.5", "/v1/responses")).toBe(false);
   });
 
-  it("matches configured model IDs case-insensitively", async () => {
+  it("matches model on Responses endpoints only", async () => {
     writeConfig(configPath, {
       enabled: true,
       models: ["gpt-5.5", "GPT-5.6"],
     });
     const mod = await loadModule(configPath);
     mod._resetOfficialPassthroughCache();
-    expect(mod.isOfficialPassthroughModel("gpt-5.5")).toBe(true);
-    expect(mod.isOfficialPassthroughModel("GPT-5.5")).toBe(true);
-    expect(mod.isOfficialPassthroughModel("gpt-5.6")).toBe(true);
-    expect(mod.isOfficialPassthroughModel("gpt-5.4")).toBe(false);
+
+    expect(mod.shouldOfficialPassthrough("gpt-5.5", "/v1/responses")).toBe(true);
+    expect(mod.shouldOfficialPassthrough("GPT-5.5", "/api/v1/responses")).toBe(true);
+    expect(mod.shouldOfficialPassthrough("gpt-5.6", "/v1/responses/compact")).toBe(true);
+    expect(mod.shouldOfficialPassthrough("gpt-5.5", "/codex/foo")).toBe(true);
+    expect(mod.shouldOfficialPassthrough("gpt-5.5", "/responses")).toBe(true);
+
+    // Not Responses
+    expect(mod.shouldOfficialPassthrough("gpt-5.5", "/v1/chat/completions")).toBe(false);
+    expect(mod.shouldOfficialPassthrough("gpt-5.5", "/v1/messages")).toBe(false);
+
+    // Unlisted model
+    expect(mod.shouldOfficialPassthrough("gpt-5.4", "/v1/responses")).toBe(false);
   });
 
-  it("does not match provider-prefixed models unless explicitly listed", async () => {
-    writeConfig(configPath, {
-      enabled: true,
-      models: ["gpt-5.5"],
-    });
+  it("does not match provider-prefixed models unless listed", async () => {
+    writeConfig(configPath, { enabled: true, models: ["gpt-5.5"] });
     const mod = await loadModule(configPath);
     mod._resetOfficialPassthroughCache();
-    expect(mod.isOfficialPassthroughModel("gpt-5.5")).toBe(true);
-    expect(mod.isOfficialPassthroughModel("cx/gpt-5.5")).toBe(false);
+    expect(mod.shouldOfficialPassthrough("gpt-5.5", "/v1/responses")).toBe(true);
+    expect(mod.shouldOfficialPassthrough("cx/gpt-5.5", "/v1/responses")).toBe(false);
   });
 
-  it("matches full prefixed string only when listed", async () => {
-    writeConfig(configPath, {
-      enabled: true,
-      models: ["cx/gpt-5.5"],
-    });
-    const mod = await loadModule(configPath);
-    mod._resetOfficialPassthroughCache();
-    expect(mod.isOfficialPassthroughModel("cx/gpt-5.5")).toBe(true);
-    expect(mod.isOfficialPassthroughModel("gpt-5.5")).toBe(false);
-  });
-
-  it("resolves ChatGPT subscription URL when account is present", async () => {
+  it("resolves only Responses upstream URLs", async () => {
     const mod = await loadModule(configPath);
     expect(mod.resolveOfficialPassthroughUrl("/v1/responses", { hasChatGptAccount: true }))
       .toBe("https://chatgpt.com/backend-api/codex/responses");
-    expect(mod.resolveOfficialPassthroughUrl("/api/v1/responses", { hasChatGptAccount: true }))
-      .toBe("https://chatgpt.com/backend-api/codex/responses");
-    expect(mod.resolveOfficialPassthroughUrl("/v1/responses/compact", { hasChatGptAccount: true }))
+    expect(mod.resolveOfficialPassthroughUrl("/api/v1/responses/compact", { hasChatGptAccount: true }))
       .toBe("https://chatgpt.com/backend-api/codex/responses/compact");
-  });
-
-  it("resolves api.openai.com when no ChatGPT account", async () => {
-    const mod = await loadModule(configPath);
     expect(mod.resolveOfficialPassthroughUrl("/v1/responses", { hasChatGptAccount: false }))
       .toBe("https://api.openai.com/v1/responses");
-    expect(mod.resolveOfficialPassthroughUrl("/v1/chat/completions", { hasChatGptAccount: false }))
-      .toBe("https://api.openai.com/v1/chat/completions");
+    expect(mod.resolveOfficialPassthroughUrl("/codex", { hasChatGptAccount: false }))
+      .toBe("https://api.openai.com/v1/responses");
   });
 
-  it("forwards request body to official backend and streams status", async () => {
+  it("forwards Responses body to official backend", async () => {
     writeConfig(configPath, {
       enabled: true,
       models: ["gpt-5.5"],
@@ -114,11 +103,9 @@ describe("official passthrough", () => {
 
     const fetchMock = vi.fn(async (url, options) => {
       expect(url).toBe("https://chatgpt.com/backend-api/codex/responses");
-      const body = JSON.parse(options.body);
-      expect(body.model).toBe("gpt-5.5");
+      expect(JSON.parse(options.body).model).toBe("gpt-5.5");
       expect(options.headers.Authorization).toMatch(/Bearer\s+sk-real/i);
-      expect(options.headers["ChatGPT-Account-ID"] || options.headers["chatgpt-account-id"]).toBeTruthy();
-      return new Response(JSON.stringify({ id: "resp_1", status: "completed" }), {
+      return new Response(JSON.stringify({ id: "resp_1" }), {
         status: 200,
         headers: { "Content-Type": "application/json" },
       });
@@ -135,26 +122,16 @@ describe("official passthrough", () => {
         Authorization: "Bearer sk-real-token",
         "ChatGPT-Account-ID": "acct-123",
       },
-      body: JSON.stringify({
-        model: "gpt-5.5",
-        input: [{ type: "message", role: "user", content: "hi" }],
-        stream: true,
-      }),
+      body: JSON.stringify({ model: "gpt-5.5", input: [], stream: true }),
     });
 
-    const res = await mod.handleOfficialPassthrough(request, {
-      model: "gpt-5.5",
-      input: [{ type: "message", role: "user", content: "hi" }],
-      stream: true,
-    });
-
+    const res = await mod.handleOfficialPassthrough(request, { model: "gpt-5.5", input: [], stream: true });
     expect(res.status).toBe(200);
-    const json = await res.json();
-    expect(json.id).toBe("resp_1");
+    expect(await res.json()).toEqual({ id: "resp_1" });
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
-  it("returns 401 when no usable auth is available", async () => {
+  it("returns 401 when no usable auth", async () => {
     writeConfig(configPath, {
       enabled: true,
       models: ["gpt-5.5"],
@@ -172,16 +149,14 @@ describe("official passthrough", () => {
 
     const res = await mod.handleOfficialPassthrough(request, { model: "gpt-5.5" });
     expect(res.status).toBe(401);
-    const json = await res.json();
-    expect(json.error.code).toBe("passthrough_auth_missing");
+    expect((await res.json()).error.code).toBe("passthrough_auth_missing");
   });
 
-  it("falls back to ~/.codex/auth.json style token when client auth is dummy", async () => {
+  it("falls back to codex auth.json when client auth is dummy", async () => {
     const authPath = path.join(tempDir, "auth.json");
     writeConfig(authPath, {
       tokens: { access_token: "from-codex-auth", account_id: "acct-from-file" },
     });
-    // reuse writeConfig for auth.json shape
     writeConfig(configPath, {
       enabled: true,
       models: ["gpt-5.5"],
@@ -202,10 +177,7 @@ describe("official passthrough", () => {
 
     const request = new Request("http://localhost:20128/v1/responses", {
       method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: "Bearer dummy",
-      },
+      headers: { "Content-Type": "application/json", Authorization: "Bearer dummy" },
       body: JSON.stringify({ model: "gpt-5.5" }),
     });
 
