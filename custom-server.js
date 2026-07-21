@@ -108,6 +108,38 @@ http.createServer = (...args) => {
   return origCreate(...rest, wrapped);
 };
 
+/**
+ * Next standalone does not include `.next/static` or `public` (CDN-oriented).
+ * Docker/CLI packaging copies them; repo-root `npm start` must do the same or
+ * the browser gets HTML without CSS/JS (unstyled icons, purple links, etc.).
+ */
+function ensureStandaloneAssets(standaloneDir) {
+  const pairs = [
+    {
+      src: path.join(__dirname, ".next", "static"),
+      dest: path.join(standaloneDir, ".next", "static"),
+      label: ".next/static",
+    },
+    {
+      src: path.join(__dirname, "public"),
+      dest: path.join(standaloneDir, "public"),
+      label: "public",
+    },
+  ];
+
+  for (const { src, dest, label } of pairs) {
+    if (!fs.existsSync(src)) continue;
+    // Already present (Docker layout or previous copy) — leave it alone.
+    if (fs.existsSync(dest)) continue;
+    try {
+      fs.cpSync(src, dest, { recursive: true });
+      console.log(`[standalone] copied ${label} → ${path.relative(__dirname, dest)}`);
+    } catch (err) {
+      console.warn(`[standalone] failed to copy ${label}:`, err?.message || err);
+    }
+  }
+}
+
 function boot() {
   // Docker / CLI: custom-server.js sits next to Next standalone server.js
   const rootServer = path.join(__dirname, "server.js");
@@ -117,10 +149,12 @@ function boot() {
   }
 
   // Repo-root after `next build`: optional standalone server
-  const standaloneServer = path.join(__dirname, ".next", "standalone", "server.js");
+  const standaloneDir = path.join(__dirname, ".next", "standalone");
+  const standaloneServer = path.join(standaloneDir, "server.js");
   if (fs.existsSync(standaloneServer)) {
+    ensureStandaloneAssets(standaloneDir);
     // Keep __dirname for prehandler path resolution; only change cwd for Next assets
-    process.chdir(path.dirname(standaloneServer));
+    process.chdir(standaloneDir);
     require(standaloneServer);
     return;
   }
