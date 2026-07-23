@@ -237,6 +237,20 @@ describe("dashboard guard local-only access", () => {
     expect(response.status).toBe(403);
   });
 
+  it("keeps Codex host-file APIs local-only", async () => {
+    mocks.getSettings.mockResolvedValue({ requireLogin: false });
+
+    const remoteCatalog = await proxy(request("/api/cli-tools/codex-catalog", {
+      host: "router.example.com",
+    }));
+    const remoteSettings = await proxy(request("/api/cli-tools/codex-settings", {
+      host: "router.example.com",
+    }));
+
+    expect(remoteCatalog.status).toBe(403);
+    expect(remoteSettings.status).toBe(403);
+  });
+
   it("rejects local-only route when Origin is non-loopback (CSRF block)", async () => {
     mocks.getSettings.mockResolvedValue({ requireLogin: false });
 

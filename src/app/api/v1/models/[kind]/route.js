@@ -1,4 +1,4 @@
-import { buildModelsList } from "../route.js";
+import { buildModelsList } from "@/lib/models/buildModelsList";
 
 // URL slug → service kind(s). `web` covers both webSearch and webFetch.
 const KIND_SLUG_MAP = {

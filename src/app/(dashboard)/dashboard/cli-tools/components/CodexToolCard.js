@@ -1,15 +1,23 @@
 "use client";
 
-import { useState, useEffect } from "react";
-import { Card, Button, ModelSelectModal, ManualConfigModal } from "@/shared/components";
+import { useCallback, useEffect, useRef, useState } from "react";
+import { Card, Button, ModelSelectModal, ManualConfigModal, SegmentedControl } from "@/shared/components";
 import Image from "next/image";
 import BaseUrlSelect from "./BaseUrlSelect";
 import ApiKeySelect from "./ApiKeySelect";
+import CodexCatalogPanel from "./CodexCatalogPanel";
 import { matchKnownEndpoint } from "./cliEndpointMatch";
+
+const ACCESS_MODES = [
+  { value: "official-passthrough", label: "Official Passthrough", icon: "verified" },
+  { value: "router-api-key", label: "9router API Key", icon: "key" },
+];
 
 export default function CodexToolCard({ tool, isExpanded, onToggle, baseUrl, apiKeys, activeProviders, cloudEnabled, initialStatus, tunnelEnabled, tunnelPublicUrl, tailscaleEnabled, tailscaleUrl }) {
   const [codexStatus, setCodexStatus] = useState(initialStatus || null);
+  const [catalogStatus, setCatalogStatus] = useState(null);
   const [checkingCodex, setCheckingCodex] = useState(false);
+  const [checkingCatalog, setCheckingCatalog] = useState(false);
   const [applying, setApplying] = useState(false);
   const [restoring, setRestoring] = useState(false);
   const [message, setMessage] = useState(null);
@@ -22,6 +30,9 @@ export default function CodexToolCard({ tool, isExpanded, onToggle, baseUrl, api
   const [modelAliases, setModelAliases] = useState({});
   const [showManualConfigModal, setShowManualConfigModal] = useState(false);
   const [customBaseUrl, setCustomBaseUrl] = useState("");
+  const [accessMode, setAccessMode] = useState("official-passthrough");
+  const modeInitializedRef = useRef(false);
+  const detectedModeRef = useRef(null);
 
   useEffect(() => {
     if (apiKeys?.length > 0 && !selectedApiKey) {
@@ -36,9 +47,27 @@ export default function CodexToolCard({ tool, isExpanded, onToggle, baseUrl, api
   useEffect(() => {
     if (isExpanded) {
       if (!codexStatus) checkCodexStatus();
+      if (!catalogStatus) checkCatalogStatus();
       fetchModelAliases();
     }
   }, [isExpanded]);
+
+  useEffect(() => {
+    if (!catalogStatus) return;
+    const detectedMode = catalogStatus.mode === "router-api-key"
+      ? "router-api-key"
+      : catalogStatus.mode === "official-passthrough"
+        ? "official-passthrough"
+        : null;
+
+    if (!modeInitializedRef.current) {
+      modeInitializedRef.current = true;
+      setAccessMode(detectedMode || "official-passthrough");
+    } else if (detectedMode && detectedMode !== detectedModeRef.current) {
+      setAccessMode(detectedMode);
+    }
+    detectedModeRef.current = detectedMode;
+  }, [catalogStatus]);
 
   const fetchModelAliases = async () => {
     try {
@@ -70,7 +99,10 @@ export default function CodexToolCard({ tool, isExpanded, onToggle, baseUrl, api
     return matchKnownEndpoint(currentUrl, { tunnelPublicUrl, tailscaleUrl }) ? "configured" : "other";
   };
 
-  const configStatus = getConfigStatus();
+  const legacyConfigStatus = getConfigStatus();
+  const configStatus = accessMode === "official-passthrough"
+    ? (catalogStatus?.mode === "official-passthrough" ? "configured" : catalogStatus ? "not_configured" : null)
+    : legacyConfigStatus;
 
   const getEffectiveBaseUrl = () => {
     const url = customBaseUrl || `${baseUrl}/v1`;
@@ -92,6 +124,26 @@ export default function CodexToolCard({ tool, isExpanded, onToggle, baseUrl, api
       setCheckingCodex(false);
     }
   };
+
+  const checkCatalogStatus = useCallback(async () => {
+    setCheckingCatalog(true);
+    try {
+      const res = await fetch("/api/cli-tools/codex-catalog");
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || "Failed to load Codex catalog status");
+      setCatalogStatus(data);
+    } catch (error) {
+      setCatalogStatus({
+        source: { valid: false, error: error.message },
+        models: [],
+        selectedModels: [],
+        selectedModelIds: [],
+        pendingTemplateUpdates: [],
+      });
+    } finally {
+      setCheckingCatalog(false);
+    }
+  }, []);
 
   const handleApplySettings = async () => {
     setApplying(true);
@@ -115,7 +167,7 @@ export default function CodexToolCard({ tool, isExpanded, onToggle, baseUrl, api
       const data = await res.json();
       if (res.ok) {
         setMessage({ type: "success", text: "Settings applied successfully!" });
-        checkCodexStatus();
+        await Promise.all([checkCodexStatus(), checkCatalogStatus()]);
       } else {
         setMessage({ type: "error", text: data.error || "Failed to apply settings" });
       }
@@ -136,7 +188,7 @@ export default function CodexToolCard({ tool, isExpanded, onToggle, baseUrl, api
         setMessage({ type: "success", text: "Settings reset successfully!" });
         setSelectedModel("");
         setSubagentModel("");
-        checkCodexStatus();
+        await Promise.all([checkCodexStatus(), checkCatalogStatus()]);
       } else {
         setMessage({ type: "error", text: data.error || "Failed to reset settings" });
       }
@@ -215,14 +267,14 @@ model = "${effectiveSubagentModel}"
 
       {isExpanded && (
         <div className="mt-4 pt-4 border-t border-border flex flex-col gap-4">
-          {checkingCodex && (
+          {checkingCodex && !codexStatus && (
             <div className="flex items-center gap-2 text-text-muted">
               <span className="material-symbols-outlined animate-spin">progress_activity</span>
               <span>Checking Codex CLI...</span>
             </div>
           )}
 
-          {!checkingCodex && codexStatus && !codexStatus.installed && (
+          {codexStatus && !codexStatus.installed && (
             <div className="flex flex-col gap-4">
               <div className="flex flex-col gap-3 p-4 bg-yellow-500/10 border border-yellow-500/30 rounded-lg">
                 <div className="flex items-start gap-3">
@@ -264,9 +316,42 @@ model = "${effectiveSubagentModel}"
             </div>
           )}
 
-          {!checkingCodex && codexStatus?.installed && (
+          {codexStatus?.installed && (
             <>
-              <div className="flex flex-col gap-2">
+              <div className="flex flex-col gap-2 rounded-lg border border-border bg-surface-2/40 p-3 sm:flex-row sm:items-center sm:justify-between">
+                <div>
+                  <p className="text-sm font-semibold text-text-main">Codex access mode</p>
+                  <p className="text-xs text-text-muted">Choose how Codex authenticates and routes requests. Switching this control does not write any files.</p>
+                </div>
+                <SegmentedControl
+                  options={ACCESS_MODES}
+                  value={accessMode}
+                  onChange={setAccessMode}
+                  size="sm"
+                  className="w-full flex-col [&>button]:w-full [&>button]:px-2 sm:w-auto sm:flex-row sm:[&>button]:w-auto sm:[&>button]:px-4"
+                />
+              </div>
+
+              {accessMode === "official-passthrough" ? (
+                checkingCatalog && !catalogStatus ? (
+                  <div className="flex items-center gap-2 py-4 text-sm text-text-muted">
+                    <span className="material-symbols-outlined animate-spin text-[18px]">progress_activity</span>
+                    Loading the official Codex cache and 9router models...
+                  </div>
+                ) : (
+                  <CodexCatalogPanel
+                    status={catalogStatus}
+                    onRefresh={() => Promise.all([checkCatalogStatus(), checkCodexStatus()])}
+                    baseUrl={baseUrl}
+                    apiKeys={apiKeys}
+                  />
+                )
+              ) : (
+                <>
+                  <div className="rounded border border-yellow-500/20 bg-yellow-500/5 px-3 py-2 text-xs text-text-muted">
+                    This legacy mode switches Codex to API-key authentication and updates both <code>config.toml</code> and <code>auth.json</code>.
+                  </div>
+                  <div className="flex flex-col gap-2">
                 {/* Endpoint (selector) */}
                 <div className="grid grid-cols-1 gap-1.5 sm:grid-cols-[8rem_auto_1fr] sm:items-center sm:gap-2">
                   <span className="text-xs font-semibold text-text-main sm:text-right sm:text-sm">Select Endpoint</span>
@@ -365,6 +450,8 @@ model = "${effectiveSubagentModel}"
                   <span className="material-symbols-outlined text-[14px] mr-1">content_copy</span>Manual Config
                 </Button>
               </div>
+                </>
+              )}
             </>
           )}
         </div>
